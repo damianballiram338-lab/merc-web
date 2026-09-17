@@ -1256,6 +1256,35 @@ footer{
 @media (max-width:34rem){ .price-cards{ grid-template-columns:1fr; } }
 @media (prefers-reduced-motion: reduce){ .price-card{ transition:none; } }
 
+/* ============================================================================
+   BEING LAYER — the WebGL being, when the device can afford him
+   ----------------------------------------------------------------------------
+   Sits BEHIND the hero's own canvas and text, both of which render without
+   him. He fades in only after his frame rate has been measured; if the
+   machine cannot hold the floor the iframe is removed and this collapses to
+   nothing, leaving the Canvas 2D figure exactly as it was.
+   ========================================================================== */
+#being-layer{
+  position:absolute; inset:0; z-index:0;
+  pointer-events:none; overflow:hidden;
+  opacity:0; transition:opacity 1.6s ease;
+}
+#being-layer.is-live{ opacity:0.85; }
+#being-layer iframe{
+  position:absolute; top:50%; left:50%;
+  width:120%; height:120%; transform:translate(-50%,-50%);
+  border:0; pointer-events:none;
+  /* He is authored on black; screen blending drops his background into the
+     page instead of stamping a rectangle over it. */
+  mix-blend-mode:screen;
+}
+/* When he is live the Canvas 2D figure steps back rather than fighting him
+   for the same silhouette. It never disappears -- he is 85% opacity over it. */
+:root[data-being="live"] #hero canvas{ opacity:0.55; transition:opacity 1.6s ease; }
+@media (prefers-reduced-motion: reduce){
+  #being-layer{ display:none !important; }
+}
+
 </style>
 
 <div id="grain" aria-hidden="true"></div>
@@ -1275,6 +1304,7 @@ footer{
 
 <main>
   <section id="hero">
+    <div id="being-layer" aria-hidden="true"></div>
     <div class="section-inner">
       <div class="eyebrow"><span class="word" style="--w:0">Merc</span> <span class="word" style="--w:1">AI</span> <span class="word" style="--w:2">Industries</span> <span class="word" style="--w:3">—</span> <span class="word" style="--w:4">Early</span> <span class="word" style="--w:5">access</span> <span class="word" style="--w:6">·</span> <span class="word" id="live-clock-eyebrow" style="--w:7">--:--:--</span></div>
       <h1><span class="word" style="--w:1">The</span> <span class="word accent" style="--w:2">one</span> <span class="word accent" style="--w:3">agent</span><br /><span class="word" style="--w:4">built</span> <span class="word" style="--w:5">to</span> <span class="word" style="--w:6">keep</span> <span class="word" style="--w:7">up</span><br /><span class="word accent" style="--w:8">with</span> <span class="word accent" style="--w:9">every</span> <span class="word accent" style="--w:10">agent.</span></h1>
@@ -3238,5 +3268,147 @@ window.MERC_SCOPE = {"priorities":[{"id":"sales_follow_up","label":"Sales follow
   }
 
   render();
+})();
+</script>
+<script>
+/* ============================================================================
+   WEBGL BEING LAYER — progressive enhancement, capability-gated
+   ----------------------------------------------------------------------------
+   The winged energy being (holographic-being/, three.js + postprocessing)
+   rendered behind the hero. He is 5.2 MB and costs ~900ms/frame on a 2016
+   Radeon Pro 450 — measured, 1.1fps — and roughly nothing on an M-series GPU.
+   So he is never in the critical path and never assumed to be affordable:
+
+     1. The page renders completely without him. The Canvas 2D figure is the
+        base layer and stays the base layer; this only fades in ON TOP.
+     2. He is not even requested until the browser is idle AND the hero is on
+        screen AND the device passes a capability probe.
+     3. After he mounts, his real frame rate is measured. If the machine
+        cannot hold the floor, he is torn down and the page returns to the
+        Canvas 2D figure. A visitor never sits through a slideshow.
+
+   An iframe, not a module import, for the reasons recorded in
+   dashboard/frontend/src/components/MercBeing.tsx: his grade is tuned against
+   his own composer and an iframe preserves it pixel for pixel, he brings his
+   own three build, and a separate document gets its own connection pool. It
+   also means teardown is one removeChild that reclaims the whole GL context.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var HOST = document.getElementById("being-layer");
+  if (!HOST) return;
+
+  var FPS_FLOOR   = 24;     // below this he is worse than nothing
+  var PROBE_MS    = 4000;   // how long to watch before judging
+  var GRACE_MS    = 6000;   // shader compile + mesh load before probing
+
+  function reduceMotion(){
+    try { return matchMedia("(prefers-reduced-motion: reduce)").matches; }
+    catch(e){ return false; }
+  }
+
+  /* -- the gate. Every "no" here is cheaper than a bad experience. -------- */
+  function capable(){
+    if (reduceMotion()) return "reduced-motion";
+    // Respect an explicit data saver.
+    var c = navigator.connection || {};
+    if (c.saveData) return "save-data";
+    if (typeof c.effectiveType === "string" && /(^|-)2g$/.test(c.effectiveType)) return "slow-network";
+    // Phones: he is authored for a wide stage and the thermal cost is real.
+    if (Math.min(screen.width, screen.height) < 700) return "small-screen";
+    if (navigator.hardwareConcurrency && navigator.hardwareConcurrency < 4) return "few-cores";
+    if (navigator.deviceMemory && navigator.deviceMemory < 4) return "low-memory";
+    // WebGL2 specifically: his composer uses HalfFloat render targets.
+    try {
+      var cv = document.createElement("canvas");
+      var gl = cv.getContext("webgl2");
+      if (!gl) return "no-webgl2";
+      if (!gl.getExtension("EXT_color_buffer_float")) return "no-float-buffers";
+      // A software renderer will technically pass every check above and then
+      // run at 3fps. SwiftShader/llvmpipe identify themselves; believe them.
+      var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      if (dbg){
+        var r = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "");
+        if (/swiftshader|llvmpipe|software/i.test(r)) return "software-renderer";
+      }
+    } catch(e){ return "webgl-threw"; }
+    return null; // null = no objection
+  }
+
+  function tellPage(state, detail){
+    document.documentElement.setAttribute("data-being", state);
+    try { window.__mercBeing = { state: state, detail: detail || null }; } catch(e){}
+  }
+
+  var frame = null;
+
+  function teardown(why){
+    if (frame && frame.parentNode) frame.parentNode.removeChild(frame);
+    frame = null;
+    HOST.classList.remove("is-live");
+    tellPage("fallback", why);
+  }
+
+  /* -- watch his real frame rate, from outside his document --------------- */
+  function probe(){
+    var doc;
+    try { doc = frame.contentWindow; } catch(e){ return teardown("cross-origin"); }
+    if (!doc || !doc.requestAnimationFrame) return teardown("no-raf");
+    var n = 0, t0 = doc.performance.now();
+    function tick(){ n++; if (frame) doc.requestAnimationFrame(tick); }
+    doc.requestAnimationFrame(tick);
+    setTimeout(function(){
+      if (!frame) return;
+      var fps = n / ((doc.performance.now() - t0) / 1000);
+      if (fps < FPS_FLOOR) teardown("slow:" + fps.toFixed(1) + "fps");
+      else tellPage("live", fps.toFixed(1) + "fps");
+    }, PROBE_MS);
+  }
+
+  function mount(){
+    frame = document.createElement("iframe");
+    frame.src = "being/index.html?avatar=1";
+    frame.title = "";
+    frame.setAttribute("aria-hidden", "true");
+    frame.setAttribute("tabindex", "-1");
+    frame.setAttribute("loading", "lazy");
+    frame.setAttribute("scrolling", "no");
+    // He is decoration behind text: he must never take input or navigate.
+    frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+    frame.addEventListener("load", function(){
+      HOST.classList.add("is-live");
+      setTimeout(probe, GRACE_MS);
+    });
+    frame.addEventListener("error", function(){ teardown("load-error"); });
+    HOST.appendChild(frame);
+    tellPage("mounting");
+  }
+
+  /* -- only once idle, only once the hero is actually on screen ----------- */
+  function whenIdle(fn){
+    if (window.requestIdleCallback) requestIdleCallback(fn, { timeout: 4000 });
+    else setTimeout(fn, 1200);
+  }
+
+  var why = capable();
+  if (why){ tellPage("skipped", why); return; }
+
+  whenIdle(function(){
+    var hero = document.getElementById("hero") || HOST;
+    if (!("IntersectionObserver" in window)) return mount();
+    var io = new IntersectionObserver(function(entries){
+      if (entries.some(function(e){ return e.isIntersecting; })){
+        io.disconnect();
+        mount();
+      }
+    }, { threshold: 0.05 });
+    io.observe(hero);
+  });
+
+  // Give the GPU back when he is off screen; he is decoration, not state.
+  document.addEventListener("visibilitychange", function(){
+    if (document.hidden && frame) teardown("page-hidden");
+  });
 })();
 </script>
