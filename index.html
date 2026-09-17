@@ -1285,7 +1285,256 @@ footer{
   #being-layer{ display:none !important; }
 }
 
+/* MercGL draws the figure's point cloud; the 2D canvas keeps everything else
+   and becomes the context-loss net rather than a competing renderer. */
+#fig-gl{ position:absolute; inset:0; width:100%; height:100%;
+         pointer-events:none; z-index:1; }
+
 </style>
+
+<script>
+/* ============================================================================
+   MercGL — the figure's point cloud on the GPU
+   ----------------------------------------------------------------------------
+   The 2D path drew the cloud with beginPath/arc/fill PER PARTICLE PER FRAME:
+   N path allocations, N rasterised circles, plus a whole-canvas blur filter to
+   hide the hard 1px edges that produced. This replaces all of it with ONE
+   draw call — gl.POINTS — where the circle and its falloff are computed in the
+   fragment shader, which is what that blur was approximating badly.
+
+   WHAT THIS DELIBERATELY DOES NOT TOUCH: the position maths. Where a particle
+   is — drift, the marching leg-lift, arm sway, the reach gesture, the jaw
+   band, glitch — is game logic that took real iteration to get right (see
+   PROGRESS.md). It stays in JS, unchanged, and simply writes into a typed
+   array instead of calling ctx.arc. Porting it into a shader would be a
+   rewrite of behaviour disguised as a rendering change.
+
+   BUFFER MANAGEMENT. One interleaved VBO, [x, y, size, r, g, b, a] per vertex,
+   allocated ONCE at the particle count and reused every frame via
+   bufferSubData. Nothing is allocated per frame and nothing is allocated per
+   particle, which is the actual win here — a per-frame `new Float32Array`
+   would hand the GC the same work the 2D path was doing.
+
+   CONTEXT LOSS IS NOT AN EDGE CASE. A WebGL context is lost routinely: GPU
+   reset, driver update, too many live contexts, a backgrounded tab on mobile.
+   `webglcontextlost` must call preventDefault() or the context is never
+   restored. While lost, `active()` returns false and the caller falls back to
+   the 2D path — which is exactly why that path is kept. On
+   `webglcontextrestored` every GL object is gone and must be rebuilt from
+   scratch; none of it survives.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var VERT = [
+    "#version 300 es",
+    "in vec2 a_pos;",         // pixels
+    "in float a_size;",
+    "in vec4 a_color;",
+    "uniform vec2 u_res;",
+    "uniform float u_dpr;",
+    "out vec4 v_color;",
+    "void main(){",
+    // pixel space -> clip space, y flipped to match canvas convention
+    "  vec2 c = (a_pos / u_res) * 2.0 - 1.0;",
+    "  gl_Position = vec4(c.x, -c.y, 0.0, 1.0);",
+    // *2 because the sprite is a quad and the visible disc is inscribed
+    "  gl_PointSize = max(1.0, a_size * u_dpr * 2.0);",
+    "  v_color = a_color;",
+    "}"
+  ].join("\n");
+
+  var FRAG = [
+    "#version 300 es",
+    "precision mediump float;",
+    "in vec4 v_color;",
+    "out vec4 outColor;",
+    "void main(){",
+    // Radial falloff instead of a hard disc. This IS the soft edge the 2D
+    // path was faking with a full-canvas blur(0.4px), except computed per
+    // fragment and free.
+    "  vec2 d = gl_PointCoord - vec2(0.5);",
+    "  float r = length(d) * 2.0;",
+    "  if (r > 1.0) discard;",
+    "  float falloff = 1.0 - smoothstep(0.35, 1.0, r);",
+    "  outColor = vec4(v_color.rgb * v_color.a * falloff, v_color.a * falloff);",
+    "}"
+  ].join("\n");
+
+  var FLOATS_PER_VERTEX = 7;   // x, y, size, r, g, b, a
+
+  function MercGL(canvas){
+    this.canvas = canvas;
+    this.gl = null;
+    this.lost = false;
+    this.count = 0;
+    this.capacity = 0;
+    this.data = null;
+    this.prog = null;
+    this.vbo = null;
+    this.vao = null;
+
+    var self = this;
+    // Must preventDefault, or the browser will never fire a restore.
+    canvas.addEventListener("webglcontextlost", function(e){
+      // Without preventDefault the browser never fires a restore.
+      e.preventDefault();
+      self.lost = true;
+      // PAUSE, don't degrade. The volatile state worth keeping is the last
+      // frame's vertex data and the particle count -- `this.data` is a plain
+      // Float32Array in JS memory, so it SURVIVES the loss untouched. Caching
+      // it means the restored context can repaint the exact frame the user was
+      // looking at instead of a blank one, and the session continues.
+      self.cached = { count: self.count, data: self.data };
+      self._teardownRefs();
+      if (window.console) console.warn("[MercGL] context lost -- paused, state cached");
+    }, false);
+    canvas.addEventListener("webglcontextrestored", function(){
+      if (window.console) console.warn("[MercGL] context restored -- rebuilding");
+      self.lost = false;
+      // Every GL object died with the context: program, shaders, VAO, VBO.
+      // Rebuild all of them from scratch, then re-upload the cached frame so
+      // the first painted frame after a restore is the one that was on screen.
+      self.lost = !self._init();
+      if (self.lost){ if (window.console) console.warn("[MercGL] re-init failed"); return; }
+      if (self.capacity) self._allocate(self.capacity);
+      if (self.cached && self.cached.data && self.data){
+        self.data.set(self.cached.data.subarray(0, Math.min(self.cached.data.length, self.data.length)));
+        self.count = Math.min(self.cached.count, self.capacity);
+        self.flush();
+        self.cached = null;
+      }
+    }, false);
+
+    this._init();
+  }
+
+  MercGL.prototype._teardownRefs = function(){
+    // Every GL object is invalid after a loss. Drop the references so nothing
+    // is reused; the driver has already freed them.
+    this.prog = this.vbo = this.vao = null;
+  };
+
+  MercGL.prototype._init = function(){
+    var gl;
+    try {
+      gl = this.canvas.getContext("webgl2", {
+        alpha: true, antialias: false, depth: false, stencil: false,
+        premultipliedAlpha: true, powerPreference: "high-performance",
+        failIfMajorPerformanceCaveat: false
+      });
+    } catch(e){ gl = null; }
+    if (!gl){ this.gl = null; return false; }
+    this.gl = gl;
+
+    var vs = this._shader(gl.VERTEX_SHADER, VERT);
+    var fs = this._shader(gl.FRAGMENT_SHADER, FRAG);
+    if (!vs || !fs){ this.gl = null; return false; }
+    var p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)){
+      if (window.console) console.warn("[MercGL] link failed:", gl.getProgramInfoLog(p));
+      this.gl = null; return false;
+    }
+    // Shaders are linked into the program; the objects themselves are done.
+    gl.deleteShader(vs); gl.deleteShader(fs);
+    this.prog = p;
+    this.loc = {
+      pos:   gl.getAttribLocation(p, "a_pos"),
+      size:  gl.getAttribLocation(p, "a_size"),
+      color: gl.getAttribLocation(p, "a_color"),
+      res:   gl.getUniformLocation(p, "u_res"),
+      dpr:   gl.getUniformLocation(p, "u_dpr")
+    };
+    return true;
+  };
+
+  MercGL.prototype._shader = function(type, src){
+    var gl = this.gl, s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      if (window.console) console.warn("[MercGL] shader error:", gl.getShaderInfoLog(s));
+      gl.deleteShader(s); return null;
+    }
+    return s;
+  };
+
+  /* Allocate once for n particles and reuse forever. */
+  MercGL.prototype._allocate = function(n){
+    var gl = this.gl;
+    if (!gl || this.lost) return;
+    this.capacity = n;
+    this.data = new Float32Array(n * FLOATS_PER_VERTEX);
+    if (this.vao) gl.deleteVertexArray(this.vao);
+    if (this.vbo) gl.deleteBuffer(this.vbo);
+    this.vao = gl.createVertexArray();
+    this.vbo = gl.createBuffer();
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, this.data.byteLength, gl.DYNAMIC_DRAW);
+    var stride = FLOATS_PER_VERTEX * 4;
+    gl.enableVertexAttribArray(this.loc.pos);
+    gl.vertexAttribPointer(this.loc.pos, 2, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(this.loc.size);
+    gl.vertexAttribPointer(this.loc.size, 1, gl.FLOAT, false, stride, 8);
+    gl.enableVertexAttribArray(this.loc.color);
+    gl.vertexAttribPointer(this.loc.color, 4, gl.FLOAT, false, stride, 12);
+    gl.bindVertexArray(null);
+  };
+
+  MercGL.prototype.active = function(){ return !!this.gl && !this.lost; };
+
+  MercGL.prototype.begin = function(n, w, h, dpr){
+    if (!this.active()) return false;
+    if (n > this.capacity) this._allocate(Math.ceil(n * 1.25));
+    this.count = 0;
+    this._w = w; this._h = h; this._dpr = dpr || 1;
+    return true;
+  };
+
+  /* Writes one particle. No allocation, no GL call -- just an array write. */
+  MercGL.prototype.point = function(x, y, size, r, g, b, a){
+    var i = this.count * FLOATS_PER_VERTEX;
+    if (i + FLOATS_PER_VERTEX > this.data.length) return;
+    var d = this.data;
+    d[i] = x; d[i+1] = y; d[i+2] = size;
+    d[i+3] = r / 255; d[i+4] = g / 255; d[i+5] = b / 255; d[i+6] = a;
+    this.count++;
+  };
+
+  /* One draw call for the whole cloud. */
+  MercGL.prototype.flush = function(){
+    if (!this.active() || !this.count) return;
+    var gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    // Additive, premultiplied: the figure is light and can never darken what
+    // is behind it. Same rule the 2D pass adopted in "render light".
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this.prog);
+    gl.uniform2f(this.loc.res, this._w, this._h);
+    gl.uniform1f(this.loc.dpr, this._dpr);
+    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+                     this.data.subarray(0, this.count * FLOATS_PER_VERTEX));
+    gl.drawArrays(gl.POINTS, 0, this.count);
+    gl.bindVertexArray(null);
+  };
+
+  MercGL.prototype.clear = function(){
+    if (!this.active()) return;
+    var gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  };
+
+  window.MercGL = MercGL;
+})();
+</script>
 
 <div id="grain" aria-hidden="true"></div>
 <div id="field"><canvas id="field-canvas"></canvas></div>
@@ -1305,6 +1554,7 @@ footer{
 <main>
   <section id="hero">
     <div id="being-layer" aria-hidden="true"></div>
+    <canvas id="fig-gl" aria-hidden="true"></canvas>
     <div class="section-inner">
       <div class="eyebrow"><span class="word" style="--w:0">Merc</span> <span class="word" style="--w:1">AI</span> <span class="word" style="--w:2">Industries</span> <span class="word" style="--w:3">—</span> <span class="word" style="--w:4">Early</span> <span class="word" style="--w:5">access</span> <span class="word" style="--w:6">·</span> <span class="word" id="live-clock-eyebrow" style="--w:7">--:--:--</span></div>
       <h1><span class="word" style="--w:1">The</span> <span class="word accent" style="--w:2">one</span> <span class="word accent" style="--w:3">agent</span><br /><span class="word" style="--w:4">built</span> <span class="word" style="--w:5">to</span> <span class="word" style="--w:6">keep</span> <span class="word" style="--w:7">up</span><br /><span class="word accent" style="--w:8">with</span> <span class="word accent" style="--w:9">every</span> <span class="word accent" style="--w:10">agent.</span></h1>
@@ -2043,6 +2293,20 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
   // ---- canvas setup ----
   var canvas = document.getElementById("field-canvas");
   var ctx = canvas.getContext("2d");
+  // WebGL is the rendering pipeline for the point cloud; `ctx` keeps the rig,
+  // the streams and the readouts, and is what the cloud falls back to if the
+  // GL context is lost. `?gl=0` forces the 2D path for comparison.
+  var glCanvas = document.getElementById("fig-gl");
+  var mercGL = null;
+  try {
+    if (glCanvas && window.MercGL &&
+        new URLSearchParams(location.search).get("gl") !== "0"){
+      mercGL = new MercGL(glCanvas);
+      if (!mercGL.active()) mercGL = null;
+    }
+  } catch (e){ mercGL = null; }
+  window.mercGL = mercGL;
+  window.__mercRenderer = mercGL ? "webgl2" : "canvas2d";
   var field = document.getElementById("field");
   var W, H, DPR;
   var scrollY = 0;
@@ -2115,6 +2379,9 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
     canvas.height = H * DPR;
     canvas.style.width = W + "px";
     canvas.style.height = H + "px";
+    // The GL canvas tracks the 2D one exactly: same CSS box, same backing
+    // store, so a point written in CSS pixels lands on the same pixel in both.
+    if (glCanvas){ glCanvas.width = W * DPR; glCanvas.height = H * DPR; }
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
     var narrow = W < 760;
@@ -2424,10 +2691,17 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
     // that otherwise read as a blocky, low-res "pixelated" dot-grid rather
     // than a coherent figure -- still an honest 2D point cloud, just
     // rendered with the edges smoothed instead of left razor-sharp.
-    var blurSupported = "filter" in ctx;
-    if (blurSupported) ctx.filter = "blur(0.4px)";
+    // GL computes a real radial falloff per fragment, so the full-canvas blur
+    // -- which existed only to hide hard 1px circle edges -- is 2D-only now.
+    var glActive = !!(window.mercGL && mercGL.active() &&
+                      mercGL.begin(figurePoints.length, W, H, DPR));
+    if (glActive) mercGL.clear();
+    // No 2D fallback for the cloud, and therefore no blur hack: the fragment
+    // shader draws a real radial falloff. The rig, streams and readouts still
+    // use ctx -- only the point cloud is GPU-exclusive.
+    var blurSupported = false;
     if (formedT > 0.01 || !reduceMotion){
-      var fp = figurePoints;
+      var fp = glActive ? figurePoints : [];   // paused when the GPU is unavailable
       for (var j = 0; j < fp.length; j++){
         var p = fp[j];
         var localT = reduceMotion ? 1 : Math.max(0, Math.min(1, formedT * 1.6 - p.delay * 0.6));
@@ -2486,13 +2760,14 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
 
         var alpha = (0.05 + 0.85 * localT) * brightT;
         var size = 0.75 + 1.05 * localT;
-        ctx.beginPath();
-        ctx.arc(x, y, size, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(" + p.r2 + "," + p.g2 + "," + p.b2 + "," + alpha.toFixed(3) + ")";
-        ctx.fill();
+        // WebGL only. While the context is lost the cloud is PAUSED -- the
+        // loop below is skipped entirely rather than falling back to a
+        // CPU-rasterised circle per particle.
+        mercGL.point(x, y, size, p.r2, p.g2, p.b2, alpha);
       }
     }
     if (blurSupported) ctx.filter = "none";
+    if (glActive) mercGL.flush();   // the single draw call
 
     // ---- NEXUS-merge: hanging neural cables from the base of the skull
     // into the chest, plus cyan circuit-line tracing along the shoulder/
