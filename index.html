@@ -1841,11 +1841,20 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
     var dx = b.x - a.x, dy = b.y - a.y;
     var len = Math.sqrt(dx * dx + dy * dy) || 1;
     var nx = -dy / len, ny = dx / len;
+    // MASTER_PROMPT_V3 A0.2: "Anatomy is built from straight polygon edges...
+    // Real muscle boundaries are continuous organic curves; the reference has
+    // no straight lines on the body at all." Each side is now a quadratic
+    // bowed outward along the normal, so a thigh swells at mid-length instead
+    // of reading as a tapered box.
+    var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    var wMid = (wA + wB) * 0.5, bulge = wMid * 0.38;
     ctx.beginPath();
     ctx.moveTo(a.x + nx * wA, a.y + ny * wA);
-    ctx.lineTo(b.x + nx * wB, b.y + ny * wB);
+    ctx.quadraticCurveTo(mx + nx * (wMid + bulge), my + ny * (wMid + bulge),
+                         b.x + nx * wB, b.y + ny * wB);
     ctx.lineTo(b.x - nx * wB, b.y - ny * wB);
-    ctx.lineTo(a.x - nx * wA, a.y - ny * wA);
+    ctx.quadraticCurveTo(mx - nx * (wMid + bulge), my - ny * (wMid + bulge),
+                         a.x - nx * wA, a.y - ny * wA);
     ctx.closePath();
     if (fillStyle){ ctx.fillStyle = fillStyle; ctx.fill(); }
     if (strokeStyle){ ctx.lineWidth = 1; ctx.strokeStyle = strokeStyle; ctx.stroke(); }
@@ -2478,26 +2487,56 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
       // actual filled legs (see drawLimb above) -- drawn before the thin
       // bone lines/joint dots so those render as accents on top of the
       // leg surface, not floating separately from it
-      var legFillA = 0.30 * formedT * brightT;
+      // ===================================================================
+      // RENDER LIGHT, NOT DIAGRAMS.  (MASTER_PROMPT_V3, Part A)
+      // -------------------------------------------------------------------
+      // Three faults that prompt names, all of them true of this figure until
+      // now, and all fixed here:
+      //   A0.1 "Every line is a hard 1px stroke ... reads as a CAD wireframe."
+      //        -> each bone is now three passes, wide+faint to narrow+bright,
+      //           which is a falloff rather than an edge.
+      //   A0.3 "The body is still fill-lit and still brighter than the
+      //        background."  -> the legs were filled rgba(40,44,54), a DARK
+      //        grey-blue laid over a darker page. An energy being cannot be
+      //        made of something darker than the air around it.
+      //   A0.4 "Dark outlines on the arms and hands ... The reference has
+      //        bright rims, never dark ones."  -> additive compositing makes a
+      //        dark value physically impossible for the whole pass.
+      // "lighter" is Canvas 2D's additive blend: destination + source. It is
+      // also why no shadowBlur is used -- six blurred passes over a 2560-wide
+      // backing store is the one thing this GPU cannot afford, and the multi
+      // pass below buys the same soft falloff for a fraction of the cost.
+      var _prevComposite = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = "lighter";
+
       var legStrokeA = 0.42 * formedT * brightT;
       for (var lsI = 0; lsI < LEG_SEGMENTS.length; lsI++){
         var seg = LEG_SEGMENTS[lsI];
+        // A faint additive core instead of the old dark fill: the limb still
+        // reads as a solid volume, but as accumulated light.
         drawLimb(
           joints[seg[0]], joints[seg[1]], seg[2], seg[3],
-          "rgba(40,44,54," + legFillA.toFixed(3) + ")",
+          "rgba(28,120,132," + (0.16 * formedT * brightT).toFixed(3) + ")",
           "rgba(90,224,224," + legStrokeA.toFixed(3) + ")"
         );
       }
 
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = "rgba(90,224,224," + rigA.toFixed(3) + ")";
-      ctx.beginPath();
-      for (var bi = 0; bi < RIG_BONES.length; bi++){
-        var from = joints[RIG_BONES[bi][0]], to = joints[RIG_BONES[bi][1]];
-        ctx.moveTo(from.x, from.y);
-        ctx.lineTo(to.x, to.y);
+      // Bones as glow, not wire. Widest pass first so the bright core lands
+      // on top of its own halo.
+      var _glowPasses = [[9, 0.055], [4, 0.16], [1.25, 0.95]];
+      for (var gp = 0; gp < _glowPasses.length; gp++){
+        ctx.lineWidth = _glowPasses[gp][0];
+        ctx.lineCap = "round";
+        ctx.strokeStyle = "rgba(90,224,224," + (rigA * _glowPasses[gp][1]).toFixed(3) + ")";
+        ctx.beginPath();
+        for (var bi = 0; bi < RIG_BONES.length; bi++){
+          var from = joints[RIG_BONES[bi][0]], to = joints[RIG_BONES[bi][1]];
+          ctx.moveTo(from.x, from.y);
+          ctx.lineTo(to.x, to.y);
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
+      ctx.lineWidth = 1;
 
       var jointA = 0.5 * formedT * brightT;
       for (var jn in joints) if (joints.hasOwnProperty(jn) && jn !== "shL" && jn !== "shR"){
@@ -2507,6 +2546,9 @@ var MERC_FLAT = "58,861,29,12,18,511,512,255,241,188,549,125,146,190,199,701,623
         ctx.fillStyle = "rgba(90,224,224," + jointA.toFixed(3) + ")";
         ctx.fill();
       }
+      // Everything else on this canvas (grain, readouts, the crimson UI) is
+      // authored for normal blending, so the additive pass ends here.
+      ctx.globalCompositeOperation = _prevComposite;
 
       // small "speaking" waveform beside the head -- 4 bars whose heights
       // track the same jawPulse driving the mouth-band particles, so the
